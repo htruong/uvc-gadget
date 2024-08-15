@@ -313,6 +313,7 @@ static int v4l2_open(char * devname, unsigned int nbufs)
     v4l2_dev.buffer_type      = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     v4l2_dev.memory_type      = V4L2_MEMORY_MMAP;
     v4l2_dev.nbufs            = nbufs;
+    v4l2_dev.current_pixelformat = 0;
     return 1;
 
 err:
@@ -589,7 +590,7 @@ static int v4l2_reqbufs_mmap(struct v4l2_device * dev, struct v4l2_requestbuffer
         }
 
         dev->mem[i].length = dev->mem[i].buf.length;
-        printf("%s: Buffer %u mapped at address %p, length %d.\n",
+        printf("%s: Buffer %u mapped at address %p, length %lu.\n",
             dev->device_type_name, i, dev->mem[i].start, dev->mem[i].length);
     }
 
@@ -772,6 +773,37 @@ static void v4l2_uvc_video_process()
     ubuf.index     = vbuf.index;
     ubuf.bytesused = vbuf.bytesused;
 
+    // Handle format-specific requirements
+    if (v4l2_dev.current_pixelformat == V4L2_PIX_FMT_H264) {
+        // Check if this is a key frame (I-frame)
+        struct v4l2_control ctrl;
+        CLEAR(ctrl);
+        ctrl.id = V4L2_CID_MPEG_VIDEO_H264_I_PERIOD;
+        if (ioctl(v4l2_dev.fd, VIDIOC_G_CTRL, &ctrl) == 0) {
+            if (vbuf.sequence % ctrl.value == 0) {
+                // This is a key frame, set UVC_STREAM_FL_FRAME_TYPE
+                ubuf.flags |= UVC_STREAM_FL_FRAME_TYPE;
+            }
+        }
+
+        // Add NAL unit start code if not present
+        uint8_t *start = (uint8_t *)v4l2_dev.mem[vbuf.index].start;
+        if (vbuf.bytesused > 4 && 
+            (start[0] != 0 || start[1] != 0 || start[2] != 0 || start[3] != 1)) {
+            // Shift data to make room for start code
+            memmove(start + 4, start, vbuf.bytesused);
+            // Insert start code
+            start[0] = 0;
+            start[1] = 0;
+            start[2] = 0;
+            start[3] = 1;
+            ubuf.bytesused += 4;
+        }
+    } else if (v4l2_dev.current_pixelformat == V4L2_PIX_FMT_MJPEG) {
+        // For MJPEG, every frame is a key frame
+        ubuf.flags |= UVC_STREAM_FL_FRAME_TYPE;
+    }
+
     if (ioctl(uvc_dev.fd, VIDIOC_QBUF, &ubuf) < 0) {
         /* Check for a USB disconnect/shutdown event. */
         if (errno == ENODEV) {
@@ -854,6 +886,9 @@ static int v4l2_apply_format(struct v4l2_device * dev, unsigned int pixelformat,
     if (ret < 0) {
         return ret;
     }
+
+    // Store the current pixel format
+    dev->current_pixelformat = pixelformat;
 
     return v4l2_get_format(dev);
 }
@@ -1015,7 +1050,9 @@ static void v4l2_get_available_formats()
     fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 
     while (ioctl(v4l2_dev.fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
-        if (fmtdesc.pixelformat == V4L2_PIX_FMT_MJPEG || fmtdesc.pixelformat == V4L2_PIX_FMT_YUYV) {
+        if (fmtdesc.pixelformat == V4L2_PIX_FMT_MJPEG || 
+            fmtdesc.pixelformat == V4L2_PIX_FMT_YUYV ||
+            fmtdesc.pixelformat == V4L2_PIX_FMT_H264) {
             frmsize.pixel_format = fmtdesc.pixelformat;
             frmsize.index = 0;
             while (ioctl(v4l2_dev.fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) >= 0) {
@@ -1440,16 +1477,31 @@ static void uvc_fill_streaming_control(struct uvc_streaming_control * ctrl,
     }
 
     memset(ctrl, 0, sizeof * ctrl);
-    ctrl->bmHint                   = 1;
-    ctrl->bFormatIndex             = iformat;
-    ctrl->bFrameIndex              = iframe;
-    ctrl->dwMaxVideoFrameSize      = get_frame_size(frame_format->video_format, frame_format->wWidth, frame_format->wHeight);
-    ctrl->dwMaxPayloadTransferSize = dwMaxPayloadTransferSize;
-    ctrl->dwFrameInterval          = frame_interval;
-    ctrl->bmFramingInfo            = 3;
-    ctrl->bMinVersion              = format_first;
-    ctrl->bMaxVersion              = format_last;
-    ctrl->bPreferedVersion         = format_last;
+    if (frame_format->video_format == V4L2_PIX_FMT_H264) {
+        ctrl->bmHint = 1;
+        ctrl->bFormatIndex = iformat;
+        ctrl->bFrameIndex = iframe;
+        ctrl->dwFrameInterval = frame_format->dwDefaultFrameInterval;
+        ctrl->wKeyFrameRate = 1;
+        ctrl->wPFrameRate = 30;
+        ctrl->wCompQuality = 0;
+        ctrl->wCompWindowSize = 0;
+        ctrl->wDelay = 0;
+        ctrl->dwMaxVideoFrameSize = frame_format->dwMaxVideoFrameBufferSize;
+        ctrl->dwMaxPayloadTransferSize = dwMaxPayloadTransferSize;
+    } else {
+        ctrl->bmHint                   = 1;
+        ctrl->bFormatIndex             = iformat;
+        ctrl->bFrameIndex              = iframe;
+        ctrl->dwMaxVideoFrameSize      = get_frame_size(frame_format->video_format, frame_format->wWidth, frame_format->wHeight);
+        ctrl->dwMaxPayloadTransferSize = dwMaxPayloadTransferSize;
+        ctrl->dwFrameInterval          = frame_interval;
+        ctrl->bmFramingInfo            = 3;
+        ctrl->bMinVersion              = format_first;
+        ctrl->bMaxVersion              = format_last;
+        ctrl->bPreferedVersion         = format_last;
+    }
+
 
     dump_uvc_streaming_control(ctrl);
 
@@ -1947,9 +1999,86 @@ static void processing_loop_fb_uvc()
     }
 }
 
+static int v4l2_setup_h264_encoding(struct v4l2_device *dev)
+{
+    struct v4l2_ext_controls ext_ctrls;
+    struct v4l2_ext_control ext_ctrl;
+
+    CLEAR(ext_ctrls);
+    CLEAR(ext_ctrl);
+
+    ext_ctrls.count = 1;
+    ext_ctrls.controls = &ext_ctrl;
+    ext_ctrl.id = V4L2_CID_MPEG_VIDEO_H264_PROFILE;
+    ext_ctrl.value = V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE;
+
+    if (ioctl(dev->fd, VIDIOC_S_EXT_CTRLS, &ext_ctrls) < 0) {
+        printf("Failed to set H.264 profile\n");
+        return -1;
+    }
+
+    ext_ctrl.id = V4L2_CID_MPEG_VIDEO_H264_LEVEL;
+    ext_ctrl.value = V4L2_MPEG_VIDEO_H264_LEVEL_4_0;
+
+    if (ioctl(dev->fd, VIDIOC_S_EXT_CTRLS, &ext_ctrls) < 0) {
+        printf("Failed to set H.264 level\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int v4l2_get_highest_resolution(struct v4l2_device *dev, unsigned int format, unsigned int *width, unsigned int *height)
+{
+    struct v4l2_frmsizeenum frmsize;
+    unsigned int max_width = 0, max_height = 0;
+
+    CLEAR(frmsize);
+    frmsize.pixel_format = format;
+
+    for (frmsize.index = 0; ioctl(dev->fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) >= 0; frmsize.index++) {
+        if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
+            if (frmsize.discrete.width > max_width && frmsize.discrete.height > max_height) {
+                max_width = frmsize.discrete.width;
+                max_height = frmsize.discrete.height;
+            }
+        } else if (frmsize.type == V4L2_FRMSIZE_TYPE_STEPWISE || frmsize.type == V4L2_FRMSIZE_TYPE_CONTINUOUS) {
+            max_width = frmsize.stepwise.max_width;
+            max_height = frmsize.stepwise.max_height;
+            break;
+        }
+    }
+
+    if (max_width == 0 || max_height == 0) {
+        return -1;
+    }
+
+    *width = max_width;
+    *height = max_height;
+    return 0;
+}
+
+static int v4l2_check_format_supported(struct v4l2_device *dev, unsigned int format)
+{
+    struct v4l2_fmtdesc fmtdesc;
+    CLEAR(fmtdesc);
+    fmtdesc.type = dev->buffer_type;
+
+    while (ioctl(dev->fd, VIDIOC_ENUM_FMT, &fmtdesc) == 0) {
+        if (fmtdesc.pixelformat == format) {
+            return 1;
+        }
+        fmtdesc.index++;
+    }
+
+    return 0;
+}
+
 static int init()
 {
     int ret;
+    unsigned int width, height;
+    unsigned int pixelformat;
 
     memset(&v4l2_dev, 0, sizeof(v4l2_dev));
     memset(&uvc_dev, 0, sizeof(uvc_dev));
@@ -1968,8 +2097,7 @@ static int init()
         if (ret < 0) {
             goto err;
         }
-
-    } else {
+    } else if (settings.source_device == DEVICE_TYPE_V4L2) {
         /* Open the V4L2 device. */
         ret = v4l2_open(settings.v4l2_devname, settings.nbufs);
         if (ret < 0) {
@@ -1978,6 +2106,53 @@ static int init()
 
         v4l2_get_available_formats();
         v4l2_get_controls();
+
+        // Determine the desired format
+        if (settings.force_format == V4L2_PIX_FMT_H264) {
+            pixelformat = V4L2_PIX_FMT_H264;
+        } else if (settings.force_format == V4L2_PIX_FMT_MJPEG) {
+            pixelformat = V4L2_PIX_FMT_MJPEG;
+        } else {
+            // Auto-select format, preferring H264 if available
+            if (v4l2_check_format_supported(&v4l2_dev, V4L2_PIX_FMT_H264)) {
+                pixelformat = V4L2_PIX_FMT_H264;
+            } else if (v4l2_check_format_supported(&v4l2_dev, V4L2_PIX_FMT_MJPEG)) {
+                pixelformat = V4L2_PIX_FMT_MJPEG;
+            } else {
+                printf("Neither H264 nor MJPEG formats are supported.\n");
+                goto err;
+            }
+        }
+
+        // Determine resolution
+        if (settings.auto_resolution) {
+            if (v4l2_get_highest_resolution(&v4l2_dev, pixelformat, &width, &height) < 0) {
+                printf("Failed to get highest resolution, falling back to default\n");
+                width = 1920;
+                height = 1080;
+            }
+        } else if (settings.width && settings.height) {
+            width = settings.width;
+            height = settings.height;
+        } else {
+            // Default resolution if nothing specified
+            width = 1920;
+            height = 1080;
+        }
+
+        // Apply the format
+        ret = v4l2_apply_format(&v4l2_dev, pixelformat, width, height);
+        if (ret < 0) {
+            goto err;
+        }
+
+        // Setup H.264 encoding if we're using H264
+        if (pixelformat == V4L2_PIX_FMT_H264) {
+            ret = v4l2_setup_h264_encoding(&v4l2_dev);
+            if (ret < 0) {
+                goto err;
+            }
+        }
     }
 
     /* Init UVC events. */
@@ -1991,7 +2166,7 @@ static int init()
     } else {
         processing_loop_v4l2_uvc();
     } 
- 
+
     uvc_events_unsubscribe();
 
     printf("\n*** UVC GADGET SHUTDOWN ***\n");
@@ -2255,6 +2430,9 @@ static void usage(const char * argv0)
     fprintf(stderr, " -r value    Framerate for framebuffer (b/w 1 and 30)\n");
     fprintf(stderr, " -u device   UVC Video Output device\n");
     fprintf(stderr, " -v device   V4L2 Video Capture device\n");
+    fprintf(stderr, " -W width    Set video width\n");
+    fprintf(stderr, " -H height   Set video height\n");
+    fprintf(stderr, " -a          Automatically select highest supported resolution\n");
     fprintf(stderr, " -x          show fps information\n");
 }
 
@@ -2299,7 +2477,7 @@ int main(int argc, char * argv[])
         return 1;
     }
 
-    while ((opt = getopt(argc, argv, "hlb:f:n:p:r:u:v:x")) != -1) {
+    while ((opt = getopt(argc, argv, "hlb:f:n:p:r:u:v:x:W:H:a")) != -1) {
         switch (opt) {
         case 'b':
             if (atoi(optarg) < 1 || atoi(optarg) > 20) {
@@ -2352,6 +2530,18 @@ int main(int argc, char * argv[])
 
         case 'x':
             settings.show_fps = true;
+            break;
+
+        case 'W':
+            settings.width = atoi(optarg);
+            break;
+
+        case 'H':
+            settings.height = atoi(optarg);
+            break;
+
+        case 'a':
+            settings.auto_resolution = true;
             break;
 
         default:

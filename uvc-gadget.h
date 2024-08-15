@@ -83,6 +83,8 @@ struct uvc_event
 #define UVC_INTF_CONTROL		0
 #define UVC_INTF_STREAMING		1
 
+#define UVC_STREAM_FL_FRAME_TYPE (1 << 0)
+
 // UVC - Request Error Code Control
 #define REQEC_NO_ERROR 0x00
 #define REQEC_NOT_READY 0x01
@@ -210,6 +212,7 @@ struct v4l2_device {
 
     double last_time_video_process;
     int buffers_processed;
+    unsigned int current_pixelformat;
 };
 
 static struct v4l2_device v4l2_dev;
@@ -230,6 +233,10 @@ struct uvc_settings {
     char * streaming_status_pin;
     bool streaming_status_enabled;
     unsigned int blink_on_startup;
+    unsigned int width;
+    unsigned int height;
+    bool auto_resolution;
+    unsigned int force_format; // Can be V4L2_PIX_FMT_H264, V4L2_PIX_FMT_MJPEG, or 0 for auto
 };
 
 struct uvc_settings settings = {
@@ -263,6 +270,8 @@ struct control_mapping_pair {
     int v4l2_minimum;
     int v4l2_maximum;
 };
+
+#define V4L2_PIX_FMT_H264     v4l2_fourcc('H', '2', '6', '4')
 
 struct control_mapping_pair control_mapping[] = {
 	{
