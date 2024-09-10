@@ -1081,6 +1081,7 @@ static void uvc_fb_fill_buffer(struct v4l2_buffer * buf)
     jpeg_destroy_compress(&cinfo);
 
     buf->bytesused = jpeg_size;
+    printf("Framebuffer MJPEG: Frame w=%u, h=%u, size=%lu\n", fb_dev.fb_width, fb_dev.fb_height, jpeg_size);
  }
 
 static void uvc_fb_video_process()
