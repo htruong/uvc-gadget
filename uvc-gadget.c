@@ -58,6 +58,8 @@
 #include <linux/videodev2.h>
 #include <linux/fb.h>
 
+#include <jpeglib.h>
+
 #include "uvc-gadget.h"
 
 volatile sig_atomic_t terminate = 0;
@@ -589,7 +591,7 @@ static int v4l2_reqbufs_mmap(struct v4l2_device * dev, struct v4l2_requestbuffer
         }
 
         dev->mem[i].length = dev->mem[i].buf.length;
-        printf("%s: Buffer %u mapped at address %p, length %d.\n",
+        printf("%s: Buffer %u mapped at address %p, length %lu.\n",
             dev->device_type_name, i, dev->mem[i].start, dev->mem[i].length);
     }
 
@@ -1048,91 +1050,37 @@ static void v4l2_get_available_formats()
 
 static void uvc_fb_fill_buffer(struct v4l2_buffer * buf)
 {
-    unsigned int rgba1;
-    unsigned int rgba2;
-    unsigned int rgba1_last;
-    unsigned int rgba2_last;
-    unsigned int yvyu;
-    unsigned int yvyu_last;
-    unsigned char r1;
-    unsigned char b1;
-    unsigned char g1;
-    unsigned char r2;
-    unsigned char b2;
-    unsigned char g2;
-    unsigned int size = fb_dev.fb_height * fb_dev.fb_width;
-    char * uvc_pixels = (char *) uvc_dev.mem[buf->index].start;
-    char * fb_pixels  = (char *) fb_dev.fb_memory;
+    unsigned char *rgb_buffer = fb_dev.fb_memory;
+    unsigned char *jpeg_buffer = uvc_dev.mem[buf->index].start;
+    unsigned long jpeg_size = 0;
 
-    buf->bytesused = size * 2;
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+    JSAMPROW row_pointer[1];
 
-    switch(fb_dev.fb_bpp) {
-        case 16:
-            while(size) {
-                b1 = (*(fb_pixels) & 0x1f) << 3;
-                g1 = (((*(fb_pixels + 1) & 0x7) << 3) | (*(fb_pixels) & 0xE0) >> 5) << 2;
-                r1 = (*(fb_pixels + 1) & 0xF8);
-                b2 = (*(fb_pixels + 2) & 0x1f) << 3;
-                g2 = (((*(fb_pixels + 3) & 0x7) << 3) | (*(fb_pixels + 2) & 0xE0) >> 5) << 2;
-                r2 = (*(fb_pixels + 3) & 0xF8);
-                yvyu = rgb2yvyu(r1, g1, b1, r2, g2, b2);
-                memcpy(uvc_pixels, &yvyu, 4);
-                fb_pixels += 4;
-                uvc_pixels += 4;
-                size -= 2;
-            }
-            break;
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
 
-        case 24:
-            while(size) {
-                memcpy(&rgba1, fb_pixels, 3);
-                memcpy(&rgba2, fb_pixels + 3, 3);
-                if (rgba1 == rgba1_last && rgba2 == rgba2_last) {
-                    memcpy(uvc_pixels, &yvyu_last, 4);
-                } else {
-                    r1 = rgba1 & 0xFF;
-                    g1 = (rgba1 >> 8) & 0xFF;
-                    b1 = (rgba1 >> 16) & 0xFF;
-                    r2 = rgba2 & 0xFF;
-                    g2 = (rgba2 >> 8) & 0xFF;
-                    b2 = (rgba2 >> 16) & 0xFF;
-                    yvyu = rgb2yvyu(r1, g1, b1, r2, g2, b2);
-                    rgba1_last = rgba1;
-                    rgba2_last = rgba2;
-                    yvyu_last = yvyu;
-                    memcpy(uvc_pixels, &yvyu, 4);
-                }
-                fb_pixels += 6;
-                uvc_pixels += 4;
-                size -= 2;
-            }
-            break;
+    jpeg_mem_dest(&cinfo, &jpeg_buffer, &jpeg_size);
 
-        case 32:
-            while(size) {
-                memcpy(&rgba1, fb_pixels, 4);
-                memcpy(&rgba2, fb_pixels + 4, 4);
-                if (rgba1 == rgba1_last && rgba2 == rgba2_last) {
-                    memcpy(uvc_pixels, &yvyu_last, 4);
-                } else {
-                    r1 = rgba1 & 0xFF;
-                    g1 = (rgba1 >> 8) & 0xFF;
-                    b1 = (rgba1 >> 16) & 0xFF;
-                    r2 = rgba2 & 0xFF;
-                    g2 = (rgba2 >> 8) & 0xFF;
-                    b2 = (rgba2 >> 16) & 0xFF;
-                    yvyu = rgb2yvyu(r1, g1, b1, r2, g2, b2);
-                    rgba1_last = rgba1;
-                    rgba2_last = rgba2;
-                    yvyu_last = yvyu;
-                    memcpy(uvc_pixels, &yvyu, 4);
-                }
-                fb_pixels += 8;
-                uvc_pixels += 4;
-                size -= 2;
-            }
-            break;
+    cinfo.image_width = fb_dev.fb_width;
+    cinfo.image_height = fb_dev.fb_height;
+    cinfo.input_components = 3;
+    cinfo.in_color_space = JCS_RGB;
+
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, 75, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    while (cinfo.next_scanline < cinfo.image_height) {
+        row_pointer[0] = &rgb_buffer[cinfo.next_scanline * fb_dev.fb_width * 3];
+        jpeg_write_scanlines(&cinfo, row_pointer, 1);
     }
+
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+
+    buf->bytesused = jpeg_size;
  }
 
 static void uvc_fb_video_process()
