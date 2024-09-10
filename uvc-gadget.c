@@ -1306,9 +1306,11 @@ static int uvc_get_frame_format(struct uvc_frame_format ** frame_format,
 
 static void uvc_dump_frame_format(struct uvc_frame_format * frame_format, const char * title)
 {
-    printf("%s: format: %d, frame: %d, resolution: %dx%d, frame_interval: %d,  bitrate: [%d, %d]\n",
+    printf("%s: format: %d (%s), frame: %d, resolution: %dx%d, frame_interval: %d,  bitrate: [%d, %d]\n",
         title,
         frame_format->bFormatIndex,
+        (frame_format->video_format == V4L2_PIX_FMT_MJPEG) ? "MJPEG" : 
+        (frame_format->video_format == V4L2_PIX_FMT_YUYV) ? "YUYV" : "Unknown",
         frame_format->bFrameIndex,
         frame_format->wWidth,
         frame_format->wHeight,
@@ -1543,6 +1545,10 @@ static void uvc_events_process_streaming(uint8_t req, uint8_t cs, struct uvc_req
     case UVC_GET_INFO:
         resp->data[0] = (uint8_t)(UVC_CONTROL_CAP_GET | UVC_CONTROL_CAP_SET);
         resp->length = 1;
+        break;
+
+    default:
+        printf("UVC: Streaming Unhandled request = %u\n", req);
         break;
     }
 }
